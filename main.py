@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import threading
 from pathlib import Path
 
 import requests
@@ -21,18 +22,24 @@ JWT_API_METHOD = os.getenv("JWT_API_METHOD", "GET").upper()
 JWT_API_TIMEOUT = float(os.getenv("JWT_API_TIMEOUT", "30"))
 JWT_API_DELAY = float(os.getenv("JWT_API_DELAY", "0.15"))
 
+# 🔁 Auto-refresh interval (hours). Default = 7
+REFRESH_INTERVAL_HOURS = float(os.getenv("REFRESH_INTERVAL_HOURS", "7"))
+# First refresh after N seconds (so server boots, then refresh runs)
+REFRESH_START_DELAY_SEC = int(os.getenv("REFRESH_START_DELAY_SEC", "10"))
+
 AUTO_START_SERVER = os.getenv("AUTO_START_SERVER", "1") == "1"
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "5000"))
 
-# Set FORCE_REGEN=1 to always rebuild tokens even if file exists
 FORCE_REGEN = os.getenv("FORCE_REGEN", "0") == "1"
-
-# Minimum valid tokens required before skipping generation
 MIN_TOKENS_OK = int(os.getenv("MIN_TOKENS_OK", "1"))
 
 
 # ---------- Helpers ----------
+def ts():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def banner(msg):
     print(f"\n{'=' * 60}\n{msg}\n{'=' * 60}")
 
@@ -88,42 +95,30 @@ def get_token(uid, password, session):
 
 # ---------- Token file validation ----------
 def token_file_status():
-    """
-    Returns (exists, valid, count, reason).
-      exists : file is present on disk
-      valid  : file is a JSON list of >=MIN_TOKENS_OK dicts with a 'token' key
-      count  : number of valid token entries
-      reason : short human-readable explanation
-    """
+    """Returns (exists, valid, count, reason)."""
     if not TOKEN_FILE.exists():
         return False, False, 0, "file does not exist"
-
     try:
         raw = TOKEN_FILE.read_text(encoding="utf-8").strip()
     except Exception as e:
         return True, False, 0, f"cannot read: {e}"
-
     if not raw:
         return True, False, 0, "file is empty"
-
     try:
         data = json.loads(raw)
     except Exception as e:
         return True, False, 0, f"invalid JSON: {e}"
-
     if not isinstance(data, list):
         return True, False, 0, f"top-level is {type(data).__name__}, expected list"
-
     valid = [d for d in data if isinstance(d, dict) and isinstance(d.get("token"), str) and d["token"].strip()]
-
     if len(valid) < MIN_TOKENS_OK:
         return True, False, len(valid), f"only {len(valid)} valid tokens (need ≥{MIN_TOKENS_OK})"
-
     return True, True, len(valid), "ok"
 
 
 # ---------- Generation ----------
-def generate_all_tokens():
+def generate_all_tokens(silent=False):
+    """Generate tokens from UID_FILE and write to TOKEN_FILE."""
     if not UID_FILE.exists():
         print(f"ERROR: {UID_FILE} not found", file=sys.stderr)
         return None
@@ -134,7 +129,8 @@ def generate_all_tokens():
         return None
 
     total = len(accounts)
-    banner(f"🔑 Generating JWT tokens for {total} accounts")
+    if not silent:
+        banner(f"🔑 Generating JWT tokens for {total} accounts")
 
     session = requests.Session()
     tokens = []
@@ -147,40 +143,30 @@ def generate_all_tokens():
 
         if not uid or not pwd:
             failed.append((uid or "?", "missing uid/password"))
-            print(f"\r{progress_bar(i, total)}  ⚠  {uid or '?'} missing fields", end="")
+            if not silent:
+                print(f"\r{progress_bar(i, total)}  ⚠  {uid or '?'} missing fields", end="")
             continue
 
         try:
             token = get_token(uid, pwd, session)
             tokens.append({"token": token})
-            print(f"\r{progress_bar(i, total)}  ✅ {uid}", end="")
+            if not silent:
+                print(f"\r{progress_bar(i, total)}  ✅ {uid}", end="")
         except Exception as e:
             failed.append((uid, str(e)[:60]))
-            print(f"\r{progress_bar(i, total)}  ❌ {uid} - {str(e)[:50]}", end="")
+            if not silent:
+                print(f"\r{progress_bar(i, total)}  ❌ {uid} - {str(e)[:50]}", end="")
 
         if JWT_API_DELAY > 0:
             time.sleep(JWT_API_DELAY)
 
-    print()
+    if not silent:
+        print()
+
     elapsed = time.time() - started
 
-    banner("📊 TOKEN GENERATION SUMMARY")
-    print(f"  Total accounts      : {total}")
-    print(f"  ✅ Tokens generated : {len(tokens)}")
-    print(f"  ❌ Failed           : {len(failed)}")
-    print(f"  ⏱  Time elapsed     : {elapsed:.1f}s")
-    if total:
-        print(f"  ⚡ Avg per account  : {elapsed/total:.2f}s")
-
-    if failed:
-        print("\n  Failed accounts (first 20):")
-        for uid, err in failed[:20]:
-            print(f"    - {uid}: {err}")
-        if len(failed) > 20:
-            print(f"    ... and {len(failed) - 20} more")
-
     if not tokens:
-        print("\n❌ No tokens generated. Aborting.", file=sys.stderr)
+        print(f"[{ts()}] ❌ No tokens generated.")
         return None
 
     # Atomic write
@@ -188,17 +174,61 @@ def generate_all_tokens():
     tmp.write_text(json.dumps(tokens, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
     tmp.replace(TOKEN_FILE)
 
-    # Verify
-    _, valid, cnt, reason = token_file_status()
-    print(f"\n💾 Saved to: {TOKEN_FILE.resolve()}")
-    print(f"   File size: {TOKEN_FILE.stat().st_size / 1024:.1f} KB")
-    if valid:
-        print(f"   ✅ Verified: {cnt} tokens on disk")
-    else:
-        print(f"   ❌ Verification failed: {reason}", file=sys.stderr)
-        return None
+    if not silent:
+        banner("📊 TOKEN GENERATION SUMMARY")
+        print(f"  Total accounts      : {total}")
+        print(f"  ✅ Tokens generated : {len(tokens)}")
+        print(f"  ❌ Failed           : {len(failed)}")
+        print(f"  ⏱  Time elapsed     : {elapsed:.1f}s")
+        if total:
+            print(f"  ⚡ Avg per account  : {elapsed/total:.2f}s")
+        if failed:
+            print("\n  Failed accounts (first 20):")
+            for uid, err in failed[:20]:
+                print(f"    - {uid}: {err}")
+            if len(failed) > 20:
+                print(f"    ... and {len(failed) - 20} more")
+        print(f"\n💾 Saved to: {TOKEN_FILE.resolve()}")
+        print(f"   File size: {TOKEN_FILE.stat().st_size / 1024:.1f} KB")
 
     return tokens
+
+
+# ---------- Auto-refresh loop (every 7 hours) ----------
+def refresh_worker():
+    """
+    Background thread:
+      1. Wait REFRESH_START_DELAY_SEC after startup
+      2. Run generation
+      3. Sleep REFRESH_INTERVAL_HOURS
+      4. Repeat
+    """
+    interval_sec = int(REFRESH_INTERVAL_HOURS * 3600)
+    print(f"[refresh] Auto-refresh thread started — interval = {REFRESH_INTERVAL_HOURS}h ({interval_sec}s)")
+    print(f"[refresh] First refresh in {REFRESH_START_DELAY_SEC}s")
+
+    time.sleep(REFRESH_START_DELAY_SEC)
+
+    cycle = 0
+    while True:
+        cycle += 1
+        start = time.time()
+        print(f"\n[refresh] ⏰ Cycle #{cycle} starting at {ts()}")
+
+        try:
+            tokens = generate_all_tokens(silent=True)
+            if tokens:
+                ok, cnt, n, reason = (lambda s: (s[1], s[2], s[2], s[3]))(token_file_status())
+                print(f"[refresh] ✅ Cycle #{cycle} done — {len(tokens)} tokens written "
+                      f"({reason}) in {time.time()-start:.1f}s")
+            else:
+                print(f"[refresh] ⚠  Cycle #{cycle} produced 0 tokens — old file kept")
+        except Exception as e:
+            print(f"[refresh] ❌ Cycle #{cycle} failed: {e}")
+
+        next_run = time.time() + interval_sec
+        print(f"[refresh] 💤 Next refresh at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_run))}")
+        time.sleep(interval_sec)
 
 
 # ---------- Server ----------
@@ -211,6 +241,7 @@ def start_server():
     print("    GET  /accounts/status?region=BD&details=1")
     print(f"\n  Working dir: {Path.cwd()}")
     print(f"  Token file : {TOKEN_FILE.resolve()}")
+    print(f"  Refresh interval: every {REFRESH_INTERVAL_HOURS}h")
     print("\n  Press Ctrl+C to stop.\n")
 
     from wsgi import app
@@ -219,14 +250,14 @@ def start_server():
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    banner("🔥 FFLIKE-7X — Token Generator + Server")
+    banner("🔥 FFLIKE-7X LIKE AUTO — Token Generator + Server")
     print(f"  Base dir   : {BASE_DIR}")
     print(f"  UID file   : {UID_FILE}")
     print(f"  Token file : {TOKEN_FILE}")
     print(f"  JWT API    : {JWT_API_URL}  [{JWT_API_METHOD}]")
+    print(f"  Auto-refresh every {REFRESH_INTERVAL_HOURS} hours")
 
     exists, valid, count, reason = token_file_status()
-
     print(f"\n📁 token_bd.json status: exists={exists}  valid={valid}  count={count}  ({reason})")
 
     need_regen = FORCE_REGEN or not valid
@@ -242,19 +273,20 @@ if __name__ == "__main__":
         else:
             print(f"⚠  token_bd.json is invalid ({reason}) → regenerating tokens...")
 
-        tokens = generate_all_tokens()
+        tokens = generate_all_tokens(silent=False)
         if tokens is None:
             print("\n⚠  Token generation failed. Server not started.", file=sys.stderr)
             sys.exit(1)
 
-    # Final pre-flight check
     exists, valid, count, reason = token_file_status()
     if not valid:
         print(f"\n❌ CRITICAL: {TOKEN_FILE} is not usable ({reason}).", file=sys.stderr)
-        print(f"   Absolute path: {TOKEN_FILE.resolve()}", file=sys.stderr)
         sys.exit(1)
 
     print(f"\n✅ Ready. {count} tokens at {TOKEN_FILE.resolve()}")
+
+    # 🔁 Start the auto-refresh thread (runs forever every 7 hours)
+    threading.Thread(target=refresh_worker, daemon=True, name="token-refresh").start()
 
     if AUTO_START_SERVER:
         time.sleep(1)
