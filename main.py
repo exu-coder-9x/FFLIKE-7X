@@ -219,7 +219,7 @@ def start_server():
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    banner("🔥 ARAFAT LIKE AUTO — Token Generator + Server")
+    banner("🔥 FFLIKE-7X — Token Generator + Server")
     print(f"  Base dir   : {BASE_DIR}")
     print(f"  UID file   : {UID_FILE}")
     print(f"  Token file : {TOKEN_FILE}")
